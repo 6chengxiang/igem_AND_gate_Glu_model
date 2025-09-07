@@ -149,3 +149,27 @@ python generate_final_analysis.py
 ✅ 数值稳定: 长时间模拟无异常值  
 ✅ 生物合理: 所有参数在合理范围内
 ✅ 数量级匹配: 死亡细胞数与肿瘤负荷匹配
+
+---
+
+## 🧪 新增功能：神经毒性评估模块
+
+在现有三室药代动力学（PK）模型的基础上，我们新增了 **谷氨酸血浆浓度与神经毒性风险评估** 功能。
+
+### 主要内容
+- **PK 模拟结合阈值判断**：  
+  通过 `simulate_three_comp_pk` 得到血浆谷氨酸浓度曲线，并与 `ToxicityThresholds` 中定义的 caution / danger 阈值对比。
+- **风险报告**：  
+  使用 `assess_neurotoxicity` 自动生成报告，包括：
+  - 最大血浆浓度 `Cb_max_uM`  
+  - 超过 caution / danger 阈值的累计时间  
+  - 风险等级（无风险 / 注意 / 危险）
+- **可视化输出**：  
+  脚本 `scripts/assess_neurotoxicity.py` 会生成结果图，包含：
+  - 血浆谷氨酸浓度曲线  
+  - 基线、caution、danger 阈值水平线  
+  - 分泌通量作用时间窗  
+
+### 使用方法
+```bash
+python -u scripts/assess_neurotoxicity.py
