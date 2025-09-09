@@ -123,6 +123,11 @@ class TherapeuticGluModel:
             # 恢复阶段参数  
             self.recovery_threshold = params.get('recovery_threshold', 20.0)  # mM
             self.postshock_export_boost = params.get('postshock_export_boost', 10.0)
+            
+            # 胞外清除机制参数
+            self.extracellular_clearance_rate = params.get('extracellular_clearance_rate', 0.5)  # h⁻¹
+            self.clearance_start_delay = params.get('clearance_start_delay', 2.0)  # 热激结束后延迟时间(h)
+            self.export_decay_rate = params.get('export_decay_rate', 0.8)  # 外排衰减速率 h⁻¹
         
         # === 维持成本与稀释 ===
         self.k_maintenance = params.get('k_maintenance', 0.1)     # h⁻¹
@@ -175,6 +180,66 @@ class TherapeuticGluModel:
             
         return k_sec
     
+    def calculate_dynamic_export_net_rate(self, Glu_in, Glu_ext, fold_GDH, t_current):
+        """
+        计算考虑胞外清除的动态外排净变化率
+        
+        Parameters:
+        -----------
+        Glu_in : float
+            胞内谷氨酸浓度 (mM)
+        Glu_ext : float
+            胞外谷氨酸浓度 (mM)
+        fold_GDH : float
+            GDH过表达倍数
+        t_current : float
+            当前时间 (h)
+            
+        Returns:
+        --------
+        float
+            胞外谷氨酸净变化率 (mM/h)
+        """
+        if self.strain_type == 'wildtype':
+            # 野生型强制不分泌
+            return 0.0
+            
+        # 1. 计算基础外排速率
+        k_sec = self.calculate_export_rate(Glu_in, fold_GDH, t_current)
+        v_secretion = k_sec * Glu_in  # 分泌速率
+        
+        # 2. 计算胞外清除速率
+        # 热激结束后逐渐启动清除机制
+        heat_shock_active = fold_GDH > 10.0
+        
+        if heat_shock_active:
+            # 热激期间：主要是分泌，轻微清除
+            v_clearance = self.extracellular_clearance_rate * 0.1 * Glu_ext
+        else:
+            # 热激后：强化清除机制
+            # 根据热激结束时间调整清除强度
+            time_since_heat_shock = max(0, t_current - 12.0)  # 假设热激在12h结束
+            
+            if time_since_heat_shock > self.clearance_start_delay:
+                # 延迟启动后，清除强度逐渐增强
+                clearance_enhancement = min(3.0, 1.0 + (time_since_heat_shock - self.clearance_start_delay) * 0.2)
+                v_clearance = self.extracellular_clearance_rate * clearance_enhancement * Glu_ext
+            else:
+                # 延迟期内保持基础清除
+                v_clearance = self.extracellular_clearance_rate * 0.2 * Glu_ext
+        
+        # 3. 动态外排衰减
+        # 热激后外排能力逐渐衰减
+        if not heat_shock_active and t_current > 12.0:
+            time_post_shock = t_current - 12.0
+            export_decay_factor = np.exp(-self.export_decay_rate * time_post_shock)
+            v_secretion = v_secretion * export_decay_factor
+        
+        # 4. 净变化率 = 分泌 - 清除
+        net_rate = v_secretion - v_clearance
+        
+        return net_rate
+    
     def apply_homeostasis(self, Glu_in, fold_GDH):
         """稳态控制机制：工程菌和野生型都有，但强度不同"""
         # 基础稳态调节
@@ -189,6 +254,31 @@ class TherapeuticGluModel:
         else:
             return base_correction
 
+    def apply_akg_homeostasis(self, AKG, fold_GDH):
+        """AKG稳态控制机制：热激后逐渐恢复到正常水平"""
+        # AKG目标浓度 (正常生理水平)
+        AKG_target = 0.5  # mM
+        
+        # 基础稳态调节强度
+        akg_homeostasis_strength = 2.0  # h⁻¹
+        
+        # 计算偏差
+        deviation = AKG - AKG_target
+        base_correction = -akg_homeostasis_strength * deviation
+        
+        if self.strain_type == 'wildtype':
+            # 野生型始终维持强稳态控制
+            return base_correction
+        else:
+            # 工程菌：热激期间放宽调节，热激后强化恢复
+            if fold_GDH > 10.0:
+                # 热激期间：大幅降低稳态调节，允许AKG堆积或消耗
+                heat_shock_suppression = 0.1  # 降低到10%
+                return base_correction * heat_shock_suppression
+            else:
+                # 热激后：强化稳态调节，促进快速恢复
+                recovery_enhancement = 2.0  # 增强2倍
+                return base_correction * recovery_enhancement
     
     def dydt(self, y, t, t7_activity):
         """
@@ -251,6 +341,7 @@ class TherapeuticGluModel:
         
         # 9. 稳态控制（传入fold_GDH用于工程菌热激判断）
         homeostasis_term = self.apply_homeostasis(Glu_in, fold_GDH)
+        akg_homeostasis_term = self.apply_akg_homeostasis(AKG, fold_GDH)
         
         # 10. 酶表达动力学
         dfold_ICD_dt = self.calculate_enzyme_expression(T7_current, fold_ICD)
@@ -268,10 +359,10 @@ class TherapeuticGluModel:
         dICIT_dt = (v_TCAin - v_ICD) * X - mu * ICIT
         
         # 胞内α-酮戊二酸
-        dAKG_dt = (v_ICD - v_GDH) * X - self.k_drain_AKG * AKG - mu * AKG
+        dAKG_dt = (v_ICD - v_GDH) * X - self.k_drain_AKG * AKG - mu * AKG + akg_homeostasis_term
         
         # 胞内谷氨酸
-        dGlu_in_dt = (v_GDH * X - v_sec * X - self.k_drain_Glu * Glu_in 
+        dGlu_in_dt = (v_GDH * X - v_sec * X* 0.8 - self.k_drain_Glu * Glu_in 
                       - mu * Glu_in + homeostasis_term)
         
         # 胞内NADPH
@@ -281,7 +372,12 @@ class TherapeuticGluModel:
         dX_dt = mu * X - self.k_maintenance * X
         
         # 胞外谷氨酸
-        dGlu_ext_dt = v_sec * X
+        if self.strain_type == 'wildtype':
+            # 野生型菌株强制不分泌谷氨酸到胞外
+            dGlu_ext_dt = 0.0
+        else:
+            # 工程菌：使用动态外排净变化率（包含清除机制）
+            dGlu_ext_dt = self.calculate_dynamic_export_net_rate(Glu_in, Glu_ext, fold_GDH, t) * X
         
         return [dGlc_ext_dt, dNH4_ext_dt, dICIT_dt, dAKG_dt, dGlu_in_dt, 
                 dNADPH_dt, dX_dt, dGlu_ext_dt, dfold_ICD_dt, dfold_GDH_dt]
@@ -391,7 +487,7 @@ class TherapeuticGluModel:
 
 # === 便捷函数 ===
 def create_heat_shock_protocol(shock_start=8.0, shock_duration=4.0, 
-                             t7_low=50.0, t7_high=3000.0):
+                             t7_low=50.0, t7_high=2000.0):
     """
     创建热激协议的T7活性函数
     
@@ -492,7 +588,7 @@ if __name__ == '__main__':
     
     # 野生型对照
     t_wt, sol_wt = wildtype_model.simulate(
-        t7_activity_func=50.0,  # 恒定低T7
+        t7_activity_func=0.0,  # 恒定低T7
         t_end=48.0,
         dt=0.1
     )
