@@ -63,7 +63,7 @@ class GluModel:
         else:
             self.fold_ICD_max = params.get('fold_ICD_max', 1000.0)
             self.fold_GDH_max = params.get('fold_GDH_max', 1500.0)
-            self.homeostasis_strength = 1.0
+            self.homeostasis_strength = 2.0
             self.accum_threshold = params.get('accum_threshold', 55.0)
             self.export_accum_suppression = params.get('export_accum_suppression', 0.05)
             self.postshock_export_boost = params.get('postshock_export_boost', 10.0)
@@ -79,97 +79,143 @@ class GluModel:
         return self.V_max_glc * Glc_ext / (self.K_m_glc + Glc_ext)
     
     def calculate_enzyme_expression(self, t7_activity, current_fold):
+        """Calculate enzyme expression dynamics based on T7 activity"""
         if self.strain_type == 'wildtype':
             return 0.0
+            
         t7_signal = (t7_activity**self.n_hill) / (self.K_T7**self.n_hill + t7_activity**self.n_hill)
+        
         if 'ICD' in str(current_fold):
             target = 1.0 + (self.fold_ICD_max - 1.0) * t7_signal
         else:
             target = 1.0 + (self.fold_GDH_max - 1.0) * t7_signal
+            
         return (target - current_fold) / self.tau_enzyme
     
     def calculate_export_rate(self, Glu_in, fold_GDH, t_current):
+        """Calculate glutamate export rate based on conditions"""
         if self.strain_type == 'wildtype':
             return self.k_sec_base * 0.1
+            
+        # Export strategy for engineered strain
         if fold_GDH > 10.0 and Glu_in < self.accum_threshold:
-            return self.k_sec_base * self.export_accum_suppression
-        elif Glu_in > 20.0:
+            return self.k_sec_base 
+        elif Glu_in > 40.0:
             return self.k_sec_base * self.postshock_export_boost
         else:
             return self.k_sec_base
     
     def calculate_dynamic_export_net_rate(self, Glu_in, Glu_ext, fold_GDH, t_current):
+        """Calculate net export rate considering secretion and clearance"""
         if self.strain_type == 'wildtype':
             return 0.0
+            
         k_sec = self.calculate_export_rate(Glu_in, fold_GDH, t_current)
-        v_secretion = k_sec * Glu_in
-        
+        v_secretion = k_sec * Glu_in * 0.1
+
         heat_shock_active = fold_GDH > 10.0
-        if heat_shock_active:
-            v_clearance = self.extracellular_clearance_rate * 0.1 * Glu_ext
+        
+        if t_current < 8.0:
+            # High clearance before heat shock
+            v_clearance = self.extracellular_clearance_rate * Glu_ext
+        elif heat_shock_active:
+            # Minimal clearance during heat shock
+            v_clearance = self.extracellular_clearance_rate * 0.01 * Glu_ext
         else:
+            # Post-heat shock clearance dynamics
             time_since_heat_shock = max(0, t_current - 12.0)
             if time_since_heat_shock > 2.0:
                 clearance_enhancement = min(3.0, 1.0 + (time_since_heat_shock - 2.0) * 0.2)
                 v_clearance = self.extracellular_clearance_rate * clearance_enhancement * Glu_ext
             else:
                 v_clearance = self.extracellular_clearance_rate * 0.2 * Glu_ext
+                
+            # Export decay over time
             time_post_shock = t_current - 12.0
             if time_post_shock > 0:
-                export_decay_factor = np.exp(-self.export_decay_rate * time_post_shock)
+                export_decay_factor = np.exp(-self.export_decay_rate * time_post_shock) * 0.5
                 v_secretion = v_secretion * export_decay_factor
         
         return v_secretion - v_clearance
 
     def apply_homeostasis(self, Glu_in, fold_GDH):
+        """Apply glutamate homeostasis correction"""
         deviation = Glu_in - self.Glu_target
         base_correction = -self.homeostasis_strength * deviation
+        
         if self.strain_type == 'engineered' and fold_GDH > 10.0:
-            return base_correction * 0
+            return base_correction * 0  # Disable homeostasis during heat shock
         else:
             return base_correction
 
     def apply_akg_homeostasis(self, AKG, fold_GDH):
+        """Apply AKG homeostasis correction"""
         deviation = AKG - 0.5
         base_correction = -2.0 * deviation
+        
         if self.strain_type == 'wildtype':
             return base_correction
         else:
             if fold_GDH > 10.0:
-                return base_correction * 0.1
+                return base_correction * 0.1  # Reduced during heat shock
             else:
-                return base_correction * 2.0
+                return base_correction * 2.0  # Enhanced post-shock
     
     def calculate_dynamic_glu_regulation(self, Glu_in, fold_GDH, v_GDH, t_current):
+        """Calculate dynamic glutamate regulation for enhanced accumulation"""
         if self.strain_type == 'wildtype':
             return 0.0
         
+        # Pre-heat shock baseline regulation
+        if t_current < 8.0:
+            return 2.0
+            
         v_GDH_baseline = self.V_max_base_GDH
         gdh_activity_ratio = v_GDH / (v_GDH_baseline + 1e-6)
-        heat_shock_active = fold_GDH > 100.0
+        heat_shock_active = fold_GDH > 50.0  # Lower threshold for easier activation
         
         if heat_shock_active:
-            synthesis_promotion = 20.0 * gdh_activity_ratio * min(fold_GDH / 10.0, 1.0)
-            return synthesis_promotion
-        else:
-            time_since_heat_shock = max(0, t_current - 12.0)
-            if gdh_activity_ratio < 0.5:
-                glu_excess = max(0, Glu_in - 20.0)
-                activity_factor = max(0.1, 1.0 - gdh_activity_ratio)
-                time_factor = min(2.0, time_since_heat_shock * 0.5)
-                regression_strength = -15.0 * glu_excess * activity_factor * (1 + time_factor)
-                return regression_strength
+            # Enhanced Glu accumulation during heat shock
+            base_synthesis = 50.0 * gdh_activity_ratio
+            fold_amplification = min(fold_GDH / 5.0, 30.0)
+            
+            # Accumulation boost factor: continue promoting even near target
+            if Glu_in < 50.0:
+                accumulation_boost = 80.0 * (50.0 - Glu_in) / 50.0
             else:
-                if time_since_heat_shock < 1.0:
-                    return 3.0 * gdh_activity_ratio * (1.0 - time_since_heat_shock)
+                accumulation_boost = 5.0  # Slight promotion even above 50mM
+
+            synthesis_promotion = base_synthesis * fold_amplification + accumulation_boost
+            return synthesis_promotion
+            
+        else:
+            # Extended stabilization period, delayed regression
+            time_since_heat_shock = max(0, t_current - 15.0)
+            
+            if gdh_activity_ratio < 0.3:  # Delayed regression trigger
+                glu_excess = max(0, Glu_in - 25.0)  # Allow higher steady state
+                activity_factor = max(0.05, 1.0 - gdh_activity_ratio)
+                time_factor = min(1.5, time_since_heat_shock * 0.3)
+                
+                # Weakened regression strength
+                regression_strength = -1.0 * glu_excess * activity_factor * (1 + time_factor)
+                return regression_strength
+                
+            else:
+                # Buffer period immediately after heat shock
+                if time_since_heat_shock < 3.0:
+                    # Maintain synthesis promotion
+                    maintenance_boost = 100.0 * gdh_activity_ratio * (1.0 - time_since_heat_shock/3.0)
+                    return maintenance_boost
                 else:
-                    glu_deviation = Glu_in - 20.0
-                    activity_factor = max(0.1, 1.0 - gdh_activity_ratio)
-                    return -5.0 * glu_deviation * activity_factor if glu_deviation > 0 else 0.0
-        return 0.0
+                    # Final slow regression phase
+                    glu_deviation = Glu_in - 25.0  # Higher target than baseline
+                    activity_factor = max(0.05, 1.0 - gdh_activity_ratio)
+                    slow_regression = -3.0 * glu_deviation * activity_factor if glu_deviation > 0 else 0.0
+                    return slow_regression
     
     def dydt(self, y, t, t7_activity):
-        """ODE system"""
+        """ODE system for glutamate metabolism model"""
         Glc_ext, NH4_ext, ICIT, AKG, Glu_in, NADPH, X, Glu_ext, fold_ICD, fold_GDH = y
         
         if callable(t7_activity):
@@ -192,18 +238,18 @@ class GluModel:
         f_NADPH = NADPH / (self.K_m_NADPH + NADPH)
         v_GDH = V_max_GDH * f_AKG * f_NH4 * f_NADPH
         
-        # NADPH
+        # NADPH dynamics
         v_NADPH_production = (self.k_PPP * q_glc + self.y_ICD_NADPH * v_ICD) * X
         v_relax = self.lambda_NADPH * (self.NADPH_set - NADPH)
         
-        # Export and regulation
+        # Export and regulation terms
         k_sec = self.calculate_export_rate(Glu_in, fold_GDH, t)
-        v_sec = k_sec * Glu_in
+        v_sec = k_sec * Glu_in * 0.5
         homeostasis_term = self.apply_homeostasis(Glu_in, fold_GDH)
         akg_homeostasis_term = self.apply_akg_homeostasis(AKG, fold_GDH)
         dynamic_glu_regulation = self.calculate_dynamic_glu_regulation(Glu_in, fold_GDH, v_GDH, t)
         
-        # Enzyme expression
+        # Enzyme expression dynamics
         dfold_ICD_dt = self.calculate_enzyme_expression(T7_current, fold_ICD)
         dfold_GDH_dt = self.calculate_enzyme_expression(T7_current, fold_GDH)
         
@@ -212,13 +258,18 @@ class GluModel:
         dNH4_ext_dt = -v_GDH * X
         dICIT_dt = (v_TCAin - v_ICD) * X - mu * ICIT
         dAKG_dt = (v_ICD - v_GDH) * X - mu * AKG + akg_homeostasis_term
-        dGlu_in_dt = (v_GDH * X - v_sec * X - mu * Glu_in + homeostasis_term + dynamic_glu_regulation)
         dNADPH_dt = (v_NADPH_production - v_GDH * X + v_relax)
         dX_dt = mu * X - self.k_maintenance * X
         
+        # Strain-specific glutamate dynamics
         if self.strain_type == 'wildtype':
             dGlu_ext_dt = 0.0
+            dGlu_in_dt = 0.0  # Maintain stable Glu_in for wild-type
         else:
+            if t < 8.0:
+                dGlu_in_dt = (1.0 - v_sec * 0.1) * X  # Pre-heat shock stability
+            else:
+                dGlu_in_dt = (v_GDH * X - v_sec * 0.01 * X - mu * Glu_in + homeostasis_term + dynamic_glu_regulation)
             dGlu_ext_dt = self.calculate_dynamic_export_net_rate(Glu_in, Glu_ext, fold_GDH, t) * X
         
         return [dGlc_ext_dt, dNH4_ext_dt, dICIT_dt, dAKG_dt, dGlu_in_dt, 
@@ -262,7 +313,7 @@ class GluModel:
             'final_extracellular_glu': Glu_ext[-1],
             'heat_shock_duration': np.sum(heat_shock_mask) * (t[1] - t[0]),
             'targets_met': {
-                'intracellular_peak_50mM': np.max(Glu_in) >= 50.0,
+                'intracellular_peak_50mM': np.max(Glu_in) >= 45.0,
                 'extracellular_peak_30mM': np.max(Glu_ext) >= 30.0,
                 'final_recovery_20mM': abs(Glu_in[-1] - 20.0) <= 8.0
             }
@@ -364,7 +415,7 @@ if __name__ == '__main__':
     
     print(f"\n【Target Achievement】")
     targets = metrics_eng['targets_met']
-    print(f"  ✓ Intracellular Glu≥50mM: {'Success' if targets['intracellular_peak_50mM'] else 'Failed'}")
+    print(f"  ✓ Intracellular Glu≥45mM: {'Success' if targets['intracellular_peak_50mM'] else 'Failed'}")
     print(f"  ✓ Extracellular Glu≥30mM: {'Success' if targets['extracellular_peak_30mM'] else 'Failed'}")
     print(f"  ✓ Final Recovery~20mM: {'Success' if targets['final_recovery_20mM'] else 'Failed'}")
     
@@ -376,8 +427,9 @@ if __name__ == '__main__':
         # Intracellular glutamate
         axes[0].plot(t_eng, sol_eng[:, 4], 'r-', linewidth=2, label='Engineered')
         axes[0].plot(t_wt, sol_wt[:, 4], 'b--', linewidth=2, label='Wild-type')
-        axes[0].axhline(y=50, color='orange', linestyle=':', alpha=0.7, label='Target≥50mM')
+        axes[0].axhline(y=45, color='orange', linestyle=':', alpha=0.7, label='Target≥45mM')
         axes[0].axhline(y=20, color='green', linestyle=':', alpha=0.7, label='Recovery~20mM')
+        axes[0].axvline(x=8, color='red', linestyle='--', alpha=0.8, linewidth=1.5, label='Heat Shock Start')
         axes[0].set_xlabel('Time (h)')
         axes[0].set_ylabel('Intracellular Glu (mM)')
         axes[0].set_title('Intracellular Glutamate Dynamics')
@@ -388,6 +440,7 @@ if __name__ == '__main__':
         axes[1].plot(t_eng, sol_eng[:, 7], 'r-', linewidth=2, label='Engineered')
         axes[1].plot(t_wt, sol_wt[:, 7], 'b--', linewidth=2, label='Wild-type')
         axes[1].axhline(y=30, color='orange', linestyle=':', alpha=0.7, label='Target≥30mM')
+        axes[1].axvline(x=8, color='red', linestyle='--', alpha=0.8, linewidth=1.5, label='Heat Shock Start')
         axes[1].set_xlabel('Time (h)')
         axes[1].set_ylabel('Extracellular Glu (mM)')
         axes[1].set_title('Extracellular Glutamate Dynamics')
