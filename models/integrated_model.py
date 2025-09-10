@@ -2,15 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 整合治疗模型模块 (Integrated Therapy Model Module)
-
-功能:
-- 将AND门、谷氨酸代谢和肿瘤生长/死亡模型整合在一起。
-- 模拟在特定环境条件下（温度和氧气），整个系统的治疗效果。
-- 模型基于ODE，描述了肿瘤细胞、死亡细胞和细胞外谷氨酸浓度的动态变化。
-
-如何使用:
-- 实例化 `IntegratedTherapyModel`。
-- 调用 `simulate` 方法，并提供环境条件字典，以运行模拟。
+—— 10态谷氨酸代谢 + 肿瘤/工程细胞动力学 的端到端模型
 """
 import os
 import numpy as np
@@ -18,54 +10,69 @@ from scipy.integrate import odeint
 
 # 导入上游模块
 from .and_gate import SimpleANDGate
-from .glu_metabolism import GluMetabolismModel
+from .glu_metabolism_en import GluMetabolismModel  # 10态版本
 from .diffusion_pk import run_neurotox_from_glu_timeseries
 
 
 class IntegratedTherapyModel:
     """
-    整合的端到端治疗模型。
-    
-    该模型将环境信号（O2, Temp）转化为T7活性，再转化为谷氨酸生产，
-    最终模拟谷氨酸如何影响肿瘤细胞的生长和死亡（铁死亡）。
+    状态向量 y (len=13):
+      0  N_tumor   存活肿瘤细胞数
+      1  D_tumor   死亡肿瘤细胞数
+      2  N_eng     存活工程细胞数
+      3  Glc_ext   细胞外葡萄糖
+      4  NH4_ext   细胞外铵
+      5  ICIT
+      6  AKG
+      7  Glu_in    细胞内谷氨酸 (mM)
+      8  NADPH
+      9  X         代谢模型的生物量代理
+     10  Glu_ext   细胞外谷氨酸 (mM)
+     11  fold_ICD
+     12  fold_GDH
     """
+    IDX = dict(
+        N_tumor=0, D_tumor=1, N_eng=2,
+        Glc_ext=3, NH4_ext=4, ICIT=5, AKG=6, Glu_in=7,
+        NADPH=8, X=9, Glu_ext=10, fold_ICD=11, fold_GDH=12
+    )
+
     def __init__(self, **params):
-        """
-        初始化整合模型，包括其子模块。
-        """
-        # 使用优化的谷氨酸代谢参数 - 确保T7活性能有效激活谷氨酸生产
-        glu_params = {
-            'K_t7': 800.0,          # 降低阈值，确保治疗条件下T7活性(~1200)能有效激活
-            'k_syn_icd': 3.0,       # 提高合成速率
-            'k_syn_gdhA': 3.0,      # 提高合成速率  
-            'k_deg_icd': 0.3,       # 适度降解
-            'k_deg_gdhA': 0.3,      # 适度降解
-            'k_dilution': 0.15,     # 降低稀释速率
-            'Vmax_gdhA': 100.0,     # 适中的最大生产速率
-            'n_hill': 4.0,
-            # V_ratio 在dydt中动态计算，这里无需设置
-        }
-        
+        # AND 门
         self.and_gate = SimpleANDGate()
-        self.glu_metabolism = GluMetabolismModel(**glu_params)
-        
-        # 肿瘤生长和死亡参数
-        self.r = params.get('r', 0.01)  # 大幅降低肿瘤生长速率，使其在治疗时间尺度内几乎不增长
-        self.K_tumor = params.get('K_tumor', 1e9)  # 肿瘤承载能力 (细胞数)
-        
-        # 铁死亡参数 - 强效铁死亡以确保治疗效果显著
-        self.k_ferroptosis_max = params.get('k_ferroptosis_max', 15.0) # 进一步提高最大铁死亡速率
-        self.K_glu = params.get('K_glu', 30.0) # 设置谷氨酸铁死亡阈值为30mM
-        self.n_glu = params.get('n_glu', 5.0) # 进一步增加Hill系数，增强开关效应
 
-        # 工程细胞生长参数
-        self.r_eng = params.get('r_eng', 0.2) # 工程细胞生长速率
-        self.K_eng = params.get('K_eng', 5e8) # 工程细胞承载能力
+        # 10态谷氨酸代谢模型（glu_metabolism_en.py）
+        # 这里传入的额外键会被忽略无害；必要参数该文件内部有默认值
+        self.glu_metabolism = GluMetabolismModel(**params)
 
-        # 新增：用于计算谷氨酸浓度的体积参数
-        # V_cell: 单个细胞体积 (L/cell), V_tumor_ext: 肿瘤间质液体积 (L)
-        self.V_cell = params.get('V_cell', 2e-12) 
+        # 肿瘤生长 & 铁死亡参数（沿用你原来的）
+        self.r = params.get('r', 0.01)
+        self.K_tumor = params.get('K_tumor', 1e9)
+        self.k_ferroptosis_max = params.get('k_ferroptosis_max', 15.0)
+        self.K_glu = params.get('K_glu', 30.0)
+        self.n_glu = params.get('n_glu', 5.0)
+
+        # 工程细胞增长
+        self.r_eng = params.get('r_eng', 0.2)
+        self.K_eng = params.get('K_eng', 5e8)
+
+        # 体积（用于神经毒性PK）
+        self.V_cell = params.get('V_cell', 2e-12)
         self.V_tumor_ext = params.get('V_tumor_ext', 0.01)
+
+        # 代谢模块默认初值（与 glu_metabolism_en.py 的 simulate 默认一致）
+        self.defaults_glu10 = np.array([
+            50.0,  # Glc_ext
+            10.0,  # NH4_ext
+            0.1,   # ICIT
+            0.5,   # AKG
+            20.0,  # Glu_in
+            0.10,  # NADPH
+            0.10,  # X
+            0.0,   # Glu_ext
+            1.0,   # fold_ICD
+            1.0    # fold_GDH
+        ], dtype=float)
 
     def get_t7_activity(self, env_conditions):
         """从AND门模块获取T7活性。"""
@@ -75,194 +82,158 @@ class IntegratedTherapyModel:
         )
 
     def dydt(self, y, t, env_conditions):
-        """
-        定义整合模型的ODE系统。
-        
-        y: array [N_tumor, D_tumor, N_eng, Glu_intra, Glu_extra, Icd, gdhA]
-            - N_tumor: 存活的肿瘤细胞数
-            - D_tumor: 死亡的肿瘤细胞数
-            - N_eng: 存活的工程细胞数
-            - Glu_intra: 工程细胞内的谷氨酸浓度 (mM)
-            - Glu_extra: 细胞外谷氨酸浓度 (mM)
-            - Icd: Icd表达水平
-            - gdhA: gdhA表达水平
-        """
-        N_tumor, D_tumor, N_eng, Glu_intra, Glu_extra, Icd, gdhA = y
-        
-        # 1. 从环境条件计算T7活性
+        ix = self.IDX
+
+        # --- 解包（细胞数量3个）---
+        N_tumor = y[ix['N_tumor']]
+        D_tumor = y[ix['D_tumor']]
+        N_eng   = y[ix['N_eng']]
+
+        # --- 代谢10态（按顺序组装，避免错位）---
+        y_glu10 = [
+            y[ix['Glc_ext']], y[ix['NH4_ext']], y[ix['ICIT']],    y[ix['AKG']],
+            y[ix['Glu_in']],  y[ix['NADPH']],  y[ix['X']],        y[ix['Glu_ext']],
+            y[ix['fold_ICD']], y[ix['fold_GDH']]
+        ]
+
+        # --- 环境 → T7 ---
         t7_activity = self.get_t7_activity(env_conditions)
-        
-        # 2. 调用谷氨酸代谢模块的ODE
-        y_glu = [Glu_intra, Glu_extra, Icd, gdhA]
-        
-        # 动态计算体积比 V_ratio = (N_eng * V_cell) / V_tumor_ext
-        current_V_ratio = (N_eng * self.V_cell) / self.V_tumor_ext
-        self.glu_metabolism.V_ratio = max(current_V_ratio, 1e-12) # 防止除零
 
-        dGlu_intra_dt, dGlu_extra_dt, dIcd_dt, dgdhA_dt = self.glu_metabolism.dydt(y_glu, t, t7_activity)
+        # --- 代谢导数（10个）---
+        (dGlc_ext_dt, dNH4_ext_dt, dICIT_dt, dAKG_dt, dGlu_in_dt,
+         dNADPH_dt, dX_dt, dGlu_ext_dt, dfold_ICD_dt, dfold_GDH_dt) = \
+            self.glu_metabolism.dydt(y_glu10, t, t7_activity)
 
-        # 3. 肿瘤细胞生长和死亡
+        # --- 肿瘤/工程细胞动力学 ---
+        # 肿瘤增长（含承载量）
         growth_rate_tumor = self.r * N_tumor * (1 - (N_tumor + N_eng) / self.K_tumor)
-        ferroptosis_rate = self.k_ferroptosis_max * (Glu_extra**self.n_glu) / (self.K_glu**self.n_glu + Glu_extra**self.n_glu)
+        # 铁死亡由细胞外谷氨酸触发
+        Glu_ext = y[ix['Glu_ext']]
+        ferroptosis_rate = self.k_ferroptosis_max * (Glu_ext**self.n_glu) / (self.K_glu**self.n_glu + Glu_ext**self.n_glu)
         death_term_tumor = ferroptosis_rate * N_tumor
-        
-        # 4. 工程细胞生长 (依赖T7活性的开关效应)
-        t7_hill_factor = (t7_activity**self.glu_metabolism.n_hill) / \
-                         (self.glu_metabolism.K_t7**self.glu_metabolism.n_hill + t7_activity**self.glu_metabolism.n_hill)
-        growth_rate_eng = self.r_eng * N_eng * (1 - (N_tumor + N_eng) / self.K_tumor) * t7_hill_factor
-        
-        # 状态变量变化率
+
+        # 工程细胞增长（T7 开关）
+        n_hill = getattr(self.glu_metabolism, 'n_hill', 3.0)
+        K_T7   = getattr(self.glu_metabolism, 'K_T7', 800.0)
+        t7_hill_factor = (t7_activity**n_hill) / (K_T7**n_hill + t7_activity**n_hill)
+        dN_eng_dt = self.r_eng * N_eng * (1 - (N_tumor + N_eng) / self.K_tumor) * t7_hill_factor
+
         dN_tumor_dt = growth_rate_tumor - death_term_tumor
         dD_tumor_dt = death_term_tumor
-        # 工程细胞也受稀释/程序性死亡影响
-        dN_eng_dt = growth_rate_eng - self.glu_metabolism.k_dilution * N_eng
-        
-        # 数值稳定性保护
-        if N_tumor < 1.0: N_tumor = 0
-        if N_eng < 1.0: N_eng = 0
-        dN_tumor_dt = dN_tumor_dt if N_tumor > 0 else 0
-        dN_eng_dt = dN_eng_dt if N_eng > 0 else 0
-        
-        return [dN_tumor_dt, dD_tumor_dt, dN_eng_dt, dGlu_intra_dt, dGlu_extra_dt, dIcd_dt, dgdhA_dt]
+
+        # 数值保护（避免负增长在近零区间抖动）
+        if N_tumor < 1.0:
+            dN_tumor_dt = 0.0
+        if N_eng < 1.0:
+            dN_eng_dt = 0.0
+
+        # --- 组装返回 ---
+        dydt_vec = np.zeros_like(y)
+        dydt_vec[ix['N_tumor']] = dN_tumor_dt
+        dydt_vec[ix['D_tumor']] = dD_tumor_dt
+        dydt_vec[ix['N_eng']]   = dN_eng_dt
+
+        dydt_vec[ix['Glc_ext']]  = dGlc_ext_dt
+        dydt_vec[ix['NH4_ext']]  = dNH4_ext_dt
+        dydt_vec[ix['ICIT']]     = dICIT_dt
+        dydt_vec[ix['AKG']]      = dAKG_dt
+        dydt_vec[ix['Glu_in']]   = dGlu_in_dt
+        dydt_vec[ix['NADPH']]    = dNADPH_dt
+        dydt_vec[ix['X']]        = dX_dt
+        dydt_vec[ix['Glu_ext']]  = dGlu_ext_dt
+        dydt_vec[ix['fold_ICD']] = dfold_ICD_dt
+        dydt_vec[ix['fold_GDH']] = dfold_GDH_dt
+
+        return dydt_vec
 
     def simulate(self, env_conditions, t_end=100.0, dt=0.5, with_neurotox=True):
         """
         运行整合治疗模拟。
-        如果 with_neurotox=True，则基于 Glu_extra(t) 触发三室PK并评估神经毒性。
         返回：t, solution, neurotox（当 with_neurotox=False 时，neurotox 为 None）
         """
         t = np.arange(0, t_end, dt)
-        # 初始条件: [N_tumor, D_tumor, N_eng, Glu_intra, Glu_extra, Icd, gdhA]
-        # 降低初始肿瘤细胞数量，使死亡效应更明显
-        y0 = [1e6, 0, 5e5, 0, 0, 0, 0]  # 肿瘤细胞1M，工程细胞0.5M
+
+        # 初始条件：3(肿瘤/工程) + 10(代谢)
+        y0 = np.zeros(13, dtype=float)
+        y0[self.IDX['N_tumor']] = 1e6
+        y0[self.IDX['D_tumor']] = 0.0
+        y0[self.IDX['N_eng']]   = 5e5
+
+        # 代谢默认初值（与 glu_metabolism_en.py 保持一致）
+        y0[self.IDX['Glc_ext'] : self.IDX['Glu_ext'] + 1] = self.defaults_glu10[:8]
+        y0[self.IDX['fold_ICD']] = self.defaults_glu10[8]
+        y0[self.IDX['fold_GDH']] = self.defaults_glu10[9]
 
         solution = odeint(self.dydt, y0, t, args=(env_conditions,))
 
-        # === 神经毒性评估（NEW）===
+        # === 神经毒性评估 ===
         neurotox = None
         if with_neurotox:
-            # y 的第 5 列（索引 4）是 Glu_extra (mM)
-            Glu_extra_mM = solution[:, 4]
+            Glu_extra_mM = solution[:, self.IDX['Glu_ext']]
             neurotox = run_neurotox_from_glu_timeseries(
                 t_h=t,
                 glu_extra_mM=Glu_extra_mM,
-                V_tumor_ext_L=self.V_tumor_ext,  # 你在 __init__ 已定义
-                pk_params=None,                  # 如需自定义，传 PKParams(...)
-                tox_thr=None,                    # 如需自定义，传 ToxicityThresholds(...)
-                baseline_uM=50.0                 # 初始基线，可按需调整
+                V_tumor_ext_L=self.V_tumor_ext,
+                pk_params=None,
+                tox_thr=None,
+                baseline_uM=50.0
             )
-        # ==========================
-
         return t, solution, neurotox
 
 
-# --- 示例 ---
+# --- 示例（可直接运行本文件做烟雾测试）---
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
-    import os
 
-    # 解决中文字体显示问题
-    try:
-        plt.rcParams['font.sans-serif'] = ['SimHei']
-        plt.rcParams['axes.unicode_minus'] = False
-    except Exception as e:
-        print(f"设置中文字体失败: {e}")
-
-    print("="*20 + " 整合治疗模型测试 " + "="*20)
-    
+    print("="*20 + " 整合治疗模型（10态）测试 " + "="*20)
     model = IntegratedTherapyModel()
-    
-    # --- 条件1: 治疗开启 (低氧, 高温) ---
+
     therapy_conditions = {'O2_percent': 1.0, 'Temp_C': 42.0}
-    
-    # --- 条件2: 对照组 (正常氧, 体温) ---
     control_conditions = {'O2_percent': 21.0, 'Temp_C': 37.0}
 
-    # --- 运行模拟 ---
     print("\n正在运行 '治疗' 条件下的模拟...")
-    t_therapy, sol_therapy, nt_therapy = model.simulate(env_conditions=therapy_conditions, t_end=200, with_neurotox=True)
+    t_th, sol_th, nt_th = model.simulate(env_conditions=therapy_conditions, t_end=200, with_neurotox=True)
     print("正在运行 '对照' 条件下的模拟...")
-    t_control,  sol_control,  nt_control  = model.simulate(env_conditions=control_conditions,  t_end=200, with_neurotox=True)
+    t_ct, sol_ct, nt_ct = model.simulate(env_conditions=control_conditions,  t_end=200, with_neurotox=True)
     print("模拟完成。")
 
-    # --- 打印简要神经毒性报告 ---
-    if nt_therapy is not None:
-        print("神经毒性报告(治疗):", nt_therapy["tox_report"])
-    if nt_control is not None:
-        print("神经毒性报告(对照):", nt_control["tox_report"])
-    
-        # --- 画“血浆Glu vs 阈值”图（治疗组）---
-        try:
-            os.makedirs("results", exist_ok=True)
-            t_h = nt_therapy["t_h"]
-            Cb  = nt_therapy["Cb_uM"]          # 血浆浓度 (μM)
-            S_t = nt_therapy["S_t_umol_per_h"] # 肿瘤分泌通量 (μmol/h) —— 用它确定阴影窗口
+    IX = model.IDX
+    # 提取关键量（使用索引表避免硬编码）
+    N_t_th, D_t_th, N_e_th = sol_th[:, IX['N_tumor']], sol_th[:, IX['D_tumor']], sol_th[:, IX['N_eng']]
+    Glu_in_th, Glu_ex_th  = sol_th[:, IX['Glu_in']],  sol_th[:, IX['Glu_ext']]
+    ICD_th, GDH_th        = sol_th[:, IX['fold_ICD']], sol_th[:, IX['fold_GDH']]
 
-            # 分泌窗口：S_t > 1e-9 的连续区间
-            mask = S_t > 1e-9
-            if np.any(mask):
-                i0 = np.argmax(mask)                               # 第一次 > 0
-                i1 = len(mask) - np.argmax(mask[::-1]) - 1         # 最后一次 > 0
-                t0, t1 = t_h[i0], t_h[i1]
-            else:
-                t0, t1 = None, None
+    N_t_ct, D_t_ct, N_e_ct = sol_ct[:, IX['N_tumor']], sol_ct[:, IX['D_tumor']], sol_ct[:, IX['N_eng']]
+    Glu_in_ct, Glu_ex_ct  = sol_ct[:, IX['Glu_in']],  sol_ct[:, IX['Glu_ext']]
+    ICD_ct, GDH_ct        = sol_ct[:, IX['fold_ICD']], sol_ct[:, IX['fold_GDH']]
 
-            plt.figure(figsize=(9,5))
-            plt.plot(t_h, Cb, label="Plasma Glu (μM)")
-            # 阈值线
-            plt.axhline(50.0,   linestyle=":",  label="Baseline 50 μM")
-            plt.axhline(100.0,  linestyle="--", label="Caution 100 μM")
-            plt.axhline(1000.0, linestyle="--", label="Danger 1.0 mM")
-
-            # 分泌窗口阴影
-            if t0 is not None and t1 is not None and t1 > t0:
-                plt.axvspan(t0, t1, alpha=0.12, label="Tumor secretion window")
-
-            # 标题备注：峰值
-            peak = float(np.max(Cb))
-            plt.title(f"Plasma Glutamate vs Neurotoxicity Thresholds\n(peak={peak:.2f} μM)")
-            plt.xlabel("Time (h)")
-            plt.ylabel("Concentration (μM)")
-            plt.legend()
-            plt.tight_layout()
-
-            out_png = "results/neurotoxicity_preview.png"
-            plt.savefig(out_png, dpi=160)
-            plt.close()                     # ← 这里补上右括号
-            print(f"已保存: {out_png}")
-        except Exception as e:
-            print(f"绘图失败: {e}")
-
-
-    # --- 提取分析数据 ---
-    # y: [N_tumor, D_tumor, N_eng, Glu_intra, Glu_extra, Icd, gdhA]
-    N_tumor_therapy, D_tumor_therapy, N_eng_therapy = sol_therapy[:, 0], sol_therapy[:, 1], sol_therapy[:, 2]
-    Glu_intra_therapy, Glu_extra_therapy = sol_therapy[:, 3], sol_therapy[:, 4]
-    Icd_therapy, gdhA_therapy = sol_therapy[:, 5], sol_therapy[:, 6]
-    
-    N_tumor_control, D_tumor_control, N_eng_control = sol_control[:, 0], sol_control[:, 1], sol_control[:, 2]
-    Glu_intra_control, Glu_extra_control = sol_control[:, 3], sol_control[:, 4]
-    Icd_control, gdhA_control = sol_control[:, 5], sol_control[:, 6]
-    
     # 计算T7活性
-    t7_therapy = model.get_t7_activity(therapy_conditions)
-    t7_control = model.get_t7_activity(control_conditions)
-    
+    t7_th = model.get_t7_activity(therapy_conditions)
+    t7_ct = model.get_t7_activity(control_conditions)
+
     # 计算治疗效果指标
-    tumor_reduction_ratio = N_tumor_therapy[-1] / N_tumor_control[-1]
-    glu_ratio = Glu_extra_therapy[-1] / (Glu_extra_control[-1] + 1e-9)
-    
-    print(f"\n=== 治疗效果分析 ===")
-    print(f"T7活性 - 治疗组: {t7_therapy:.1f} AU, 对照组: {t7_control:.1f} AU")
-    print(f"谷氨酸浓度 - 治疗组: {Glu_extra_therapy[-1]:.3f} mM, 对照组: {Glu_extra_control[-1]:.3f} mM")
+    tumor_reduction_ratio = N_t_th[-1] / max(N_t_ct[-1], 1e-9)
+    glu_ratio = Glu_ex_th[-1] / (Glu_ex_ct[-1] + 1e-9)
+
+    print(f"\n=== 治疗效果分析（10态）===")
+    print(f"T7活性 - 治疗组: {t7_th:.1f} AU, 对照组: {t7_ct:.1f} AU")
+    print(f"谷氨酸浓度(外) - 治疗组: {Glu_ex_th[-1]:.3f} mM, 对照组: {Glu_ex_ct[-1]:.3f} mM")
     print(f"谷氨酸比值 (治疗/对照): {glu_ratio:.3f}")
-    print(f"肿瘤细胞数量 - 治疗组: {N_tumor_therapy[-1]:.1e}, 对照组: {N_tumor_control[-1]:.1e}")
-    print(f"死亡细胞数量 - 治疗组: {D_tumor_therapy[-1]:.1e}, 对照组: {D_tumor_control[-1]:.1e}")
+    print(f"肿瘤细胞数量 - 治疗组: {N_t_th[-1]:.1e}, 对照组: {N_t_ct[-1]:.1e}")
+    print(f"死亡细胞数量 - 治疗组: {D_t_th[-1]:.1e}, 对照组: {D_t_ct[-1]:.1e}")
     print(f"肿瘤细胞存活率 (治疗/对照): {tumor_reduction_ratio:.3f}")
-    
-    # 计算铁死亡速率检查
-    ferroptosis_rate_therapy = model.k_ferroptosis_max * (Glu_extra_therapy[-1]**model.n_glu) / (model.K_glu**model.n_glu + Glu_extra_therapy[-1]**model.n_glu)
-    ferroptosis_rate_control = model.k_ferroptosis_max * (Glu_extra_control[-1]**model.n_glu) / (model.K_glu**model.n_glu + Glu_extra_control[-1]**model.n_glu)
-    print(f"铁死亡速率 - 治疗组: {ferroptosis_rate_therapy:.6f} /hr, 对照组: {ferroptosis_rate_control:.6f} /hr")
-    
-    print("="*50)
+
+    # 简单画图（治疗 vs 对照的外源Glu）
+    try:
+        os.makedirs("results", exist_ok=True)
+        plt.figure(figsize=(9,5))
+        plt.plot(t_th, Glu_ex_th, label='Therapy Glu_ext (mM)')
+        plt.plot(t_ct, Glu_ex_ct, '--', label='Control Glu_ext (mM)')
+        plt.xlabel('Time (h)'); plt.ylabel('Concentration (mM)')
+        plt.legend(); plt.tight_layout()
+        out_png = "results/glu_ext_10state.png"
+        plt.savefig(out_png, dpi=160)
+        plt.close()
+        print(f"已保存: {out_png}")
+    except Exception as e:
+        print(f"绘图失败: {e}")

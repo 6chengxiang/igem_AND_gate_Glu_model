@@ -17,6 +17,7 @@ import numpy as np
 from scipy.integrate import odeint
 from scipy.sparse import spdiags
 from scipy.sparse.linalg import spsolve
+from . import pk_toxicity as pkt
 
 class MultiCompartmentPK:
     """
@@ -164,21 +165,29 @@ def _finite_diff_flux_from_conc(
     """
     把细胞外浓度时序 C_extra(t) 转成肿瘤室分泌通量 S_t(t)（μmol/h）：
         S_t(t) ≈ d/dt [ C_extra(t) [mM] * V_ext [L] ] * 1000
-    说明：
-    - 这里 V_ext 视作常数，所以 d/dt(C*V) = V * dC/dt。
-    - 默认只保留“净外排”为正的部分（clip_nonneg=True），即负值截断为0。
-      如果你想保留双向通量，把 clip_nonneg 设为 False。
     """
-    t_h = np.asarray(t_h, dtype=float)
-    c_mM = np.asarray(glu_extra_mM, dtype=float)
+    t = np.asarray(t_h, dtype=float)
+    c = np.asarray(glu_extra_mM, dtype=float)
+
+    # 排序+去重，保证时间严格递增
+    order = np.argsort(t)
+    t = t[order]; c = c[order]
+    t_unique = np.unique(t)
+    if t_unique.size < 2:
+        # 不足以做微分，返回全零通量
+        return np.zeros_like(t_unique, dtype=float)
+    if t_unique.size != t.size:
+        c = np.interp(t_unique, t, c)
+        t = t_unique
 
     # 数值微分（单位：mM/h）
-    dc_dt_mM_per_h = np.gradient(c_mM, t_h, edge_order=2)
+    dc_dt_mM_per_h = np.gradient(c, t, edge_order=2)
 
     # mM * L = mmol  -> ×1000 变成 μmol
     umol_per_h = 1000.0 * V_tumor_ext_L * dc_dt_mM_per_h
 
     return np.clip(umol_per_h, 0.0, None) if clip_nonneg else umol_per_h
+
 
 
 def run_neurotox_from_glu_timeseries(
@@ -191,32 +200,58 @@ def run_neurotox_from_glu_timeseries(
 ):
     """
     用 Glu_extra(t) 推导分泌通量 S_t(t)，驱动三室 PK，并评估神经毒性。
-    返回 dict:
-      {
-        't_h','S_t_umol_per_h','Cb_uM','Ct_uM','Cn_uM','tox_report'
-      }
+    返回 dict: {'t_h','S_t_umol_per_h','Cb_uM','Ct_uM','Cn_uM','tox_report'}
     """
-    # 在包内使用相对导入；保持函数内导入，避免该文件单独作为脚本运行时出错
-    from .pk_toxicity import (
-        PKParams, ToxicityThresholds,
-        simulate_three_comp_pk, assess_neurotoxicity
-    )
+    
 
-    pk_params = pk_params or PKParams()
-    tox_thr   = tox_thr   or ToxicityThresholds()
+    # ——— 1) 标准化 & 去重时间序列 —— 
+    t_h = np.asarray(t_h, dtype=float)
+    glu_extra_mM = np.asarray(glu_extra_mM, dtype=float)
 
-    # 由浓度时序得到肿瘤室分泌通量（μmol/h）
+    order = np.argsort(t_h)
+    t_h = t_h[order]
+    glu_extra_mM = glu_extra_mM[order]
+
+    # 去重（严格递增）
+    uniq_t = np.unique(t_h)
+    if len(uniq_t) != len(t_h):
+        # 重插值到去重后的时间轴
+        glu_extra_mM = np.interp(uniq_t, t_h, glu_extra_mM)
+        t_h = uniq_t
+
+    # ——— 2) 浓度 → 分泌通量 S(t)（μmol/h），并清洗 —— 
     S_t = _finite_diff_flux_from_conc(t_h, glu_extra_mM, V_tumor_ext_L, clip_nonneg=True)
+    S_t = np.nan_to_num(S_t, nan=0.0, posinf=0.0, neginf=0.0)
+    if np.any(S_t > 0):
+        # 去掉极端尖峰
+        S_t = np.clip(S_t, 0.0, np.percentile(S_t, 99.5))
+        # 轻微平滑，减少刚性（窗口≈2%长度，>=3且为奇数）
+        if len(S_t) >= 5:
+            win = max(3, int(0.02 * len(S_t)))
+            if win % 2 == 0: win += 1
+            win = min(win, len(S_t) if len(S_t) % 2 == 1 else len(S_t) - 1)
+            if win >= 3:
+                pad = win // 2
+                S_pad = np.pad(S_t, (pad, pad), mode="edge")
+                ker = np.ones(win, dtype=float) / win
+                S_t = np.convolve(S_pad, ker, mode="valid")[:len(S_t)]
+    else:
+        S_t = np.zeros_like(S_t)
 
-    # 三室 PK（给三个室一个生理基线浓度，单位 μM）
-    Cb_uM, Ct_uM, Cn_uM = simulate_three_comp_pk(
+    # ——— 3) PK 参数/阈值对象 —— 
+    pk_params = pk_params or pkt.PKParams()
+    tox_thr   = tox_thr   or pkt.ToxicityThresholds()
+
+    # ——— 4) 三室 PK（三个室的初始浓度给到生理基线 μM）—— 
+    Cb_uM, Ct_uM, Cn_uM = pkt.simulate_three_comp_pk(
         t_grid_h=t_h,
         S_t_umol_per_h=S_t,
         params=pk_params,
         Cb0_uM=baseline_uM, Ct0_uM=baseline_uM, Cn0_uM=baseline_uM
     )
 
-    report = assess_neurotoxicity(Cb_uM, t_h, tox_thr)
+    # ——— 5) 神经毒性评估 —— 
+    report = pkt.assess_neurotoxicity(Cb_uM, t_h, thr=tox_thr)
 
     return {
         "t_h": t_h,
@@ -226,6 +261,7 @@ def run_neurotox_from_glu_timeseries(
         "Cn_uM": Cn_uM,
         "tox_report": report,
     }
+
    
 
 # --- 示例 ---
