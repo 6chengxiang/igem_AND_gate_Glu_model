@@ -358,7 +358,7 @@ if __name__ == '__main__':
         'k_sec_base': 0.8,
         'k_maintenance': 0.08,
         'k_PPP': 0.4,
-        'lambda_NADPH': 2.0,
+        'lambda_NADPH': 20.0,
         'NADPH_set': 0.15,
     }
     
